@@ -1560,6 +1560,7 @@ dependencies = [
 [[package]]
 name = "lwext4_core"
 version = "0.1.0"
+source = "git+https://github.com/GalOS-hdu/lwext4_core.git?rev=896fbf2#896fbf2682f06e8dfbae179fce18f569a7436b6d"
 dependencies = [
  "bitflags 2.11.0",
  "byteorder",
