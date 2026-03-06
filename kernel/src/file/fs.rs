@@ -117,6 +117,22 @@ impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
+
+    pub fn listxattr(&self, buffer: &mut [u8]) -> AxResult<usize> {
+        self.inner.location().listxattr(buffer)
+    }
+
+    pub fn getxattr(&self, name: &str, buffer: &mut [u8]) -> AxResult<usize> {
+        self.inner.location().getxattr(name, buffer)
+    }
+
+    pub fn setxattr(&self, name: &str, value: &[u8], flags: u32) -> AxResult<()> {
+        self.inner.location().setxattr(name, value, flags)
+    }
+
+    pub fn removexattr(&self, name: &str) -> AxResult<()> {
+        self.inner.location().removexattr(name)
+    }
 }
 
 fn path_for(loc: &Location) -> Cow<'static, str> {
@@ -208,6 +224,22 @@ impl Directory {
     /// Get the inner node of the directory.
     pub fn inner(&self) -> &Location {
         &self.inner
+    }
+
+    pub fn listxattr(&self, buffer: &mut [u8]) -> AxResult<usize> {
+        self.inner.listxattr(buffer)
+    }
+
+    pub fn getxattr(&self, name: &str, buffer: &mut [u8]) -> AxResult<usize> {
+        self.inner.getxattr(name, buffer)
+    }
+
+    pub fn setxattr(&self, name: &str, value: &[u8], flags: u32) -> AxResult<()> {
+        self.inner.setxattr(name, value, flags)
+    }
+
+    pub fn removexattr(&self, name: &str) -> AxResult<()> {
+        self.inner.removexattr(name)
     }
 }
 
