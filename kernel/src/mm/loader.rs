@@ -124,7 +124,19 @@ fn map_elf<'a>(
             backend,
         )?;
 
-        // TDOO: flush the I-cache
+    }
+
+    // Flush the I-cache to ensure newly loaded code is visible to instruction
+    // fetches. On architectures with non-coherent I/D caches, stale instruction
+    // cache entries could cause execution of old or garbage data.
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    unsafe {
+        core::arch::asm!("fence.i");
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Flush entire I-cache to Point of Unification, then synchronize.
+        core::arch::asm!("ic iallu", "dsb ish", "isb");
     }
 
     Ok(elf_parser)

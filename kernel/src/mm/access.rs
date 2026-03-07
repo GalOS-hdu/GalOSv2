@@ -46,18 +46,49 @@ fn check_region(start: VirtAddr, layout: Layout, access_flags: MappingFlags) -> 
     }
 
     let curr = current();
-    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace = curr.as_thread().proc_data.aspace.lock();
 
     if !aspace.can_access_range(start, layout.size(), access_flags) {
         return Err(AxError::BadAddress);
     }
 
+    // Fast path: check if all pages are already mapped with sufficient
+    // permissions by querying the page table directly. This avoids the
+    // heavier populate_area call for the common case where memory has
+    // already been faulted in.
     let page_start = start.align_down_4k();
     let page_end = (start + layout.size()).align_up_4k();
+    let pt = aspace.page_table();
+    let mut all_mapped = true;
+    let mut addr = page_start;
+    while addr < page_end {
+        match pt.query(addr) {
+            Ok((_, flags, page_size)) if flags.contains(access_flags) => {
+                addr += page_size as usize;
+            }
+            _ => {
+                all_mapped = false;
+                break;
+            }
+        }
+    }
+
+    if all_mapped {
+        return Ok(());
+    }
+
+    // Slow path: some pages need to be populated.
+    drop(aspace);
+    let mut aspace = curr.as_thread().proc_data.aspace.lock();
     aspace.populate_area(page_start, page_end - page_start, access_flags)?;
 
     Ok(())
 }
+
+/// Number of pages to batch-validate at a time when scanning null-terminated
+/// user data. This reduces the number of aspace lock acquisitions from O(n)
+/// per page to O(n / BATCH).
+const NULL_TERM_BATCH_PAGES: usize = 16;
 
 fn check_null_terminated<T: PartialEq + Default>(
     start: VirtAddr,
@@ -70,7 +101,7 @@ fn check_null_terminated<T: PartialEq + Default>(
 
     let zero = T::default();
 
-    let mut page = start.align_down_4k();
+    let mut validated_end = start.align_down_4k();
 
     let start = start.as_ptr_of::<T>();
     let mut len = 0;
@@ -80,21 +111,28 @@ fn check_null_terminated<T: PartialEq + Default>(
             // SAFETY: This won't overflow the address space since we'll check
             // it below.
             let ptr = unsafe { start.add(len) };
-            while ptr as usize >= page.as_ptr() as usize {
-                // We cannot prepare `aspace` outside of the loop, since holding
-                // aspace requires a mutex which would be required on page
-                // fault, and page faults can trigger inside the loop.
-
-                // TODO: this is inefficient, but we have to do this instead of
-                // querying the page table since the page might has not been
-                // allocated yet.
+            if ptr as usize >= validated_end.as_ptr() as usize {
+                // We cannot hold `aspace` across the scan loop since a page
+                // fault inside would deadlock. Instead, batch-validate
+                // multiple pages at once to amortize locking overhead.
                 let curr = current();
                 let aspace = curr.as_thread().proc_data.aspace.lock();
-                if !aspace.can_access_range(page, PAGE_SIZE_4K, access_flags) {
-                    return Err(AxError::BadAddress);
+                let batch_size = NULL_TERM_BATCH_PAGES * PAGE_SIZE_4K;
+                let check_start = validated_end;
+                // Validate as many contiguous pages as we can, up to the batch limit.
+                let mut check_size = 0;
+                while check_size < batch_size {
+                    let page = check_start + check_size;
+                    if !aspace.can_access_range(page, PAGE_SIZE_4K, access_flags) {
+                        if check_size == 0 {
+                            // The very first page we need is inaccessible.
+                            return Err(AxError::BadAddress);
+                        }
+                        break;
+                    }
+                    check_size += PAGE_SIZE_4K;
                 }
-
-                page += PAGE_SIZE_4K;
+                validated_end = check_start + check_size;
             }
 
             // This might trigger a page fault
