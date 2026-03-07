@@ -123,7 +123,6 @@ fn map_elf<'a>(
             false,
             backend,
         )?;
-
     }
 
     // Flush the I-cache to ensure newly loaded code is visible to instruction
