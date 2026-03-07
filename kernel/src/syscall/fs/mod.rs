@@ -11,6 +11,6 @@ mod stat;
 mod xattr;
 
 pub use self::{
-    ctl::*, event::*, fd_ops::*, io::*, memfd::*, mount::*, pidfd::*, pipe::*, signalfd::*, stat::*,
-    xattr::*,
+    ctl::*, event::*, fd_ops::*, io::*, memfd::*, mount::*, pidfd::*, pipe::*, signalfd::*,
+    stat::*, xattr::*,
 };

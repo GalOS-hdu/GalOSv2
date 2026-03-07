@@ -64,7 +64,9 @@ fn sys_fgetxattrat(
         let result = if let Some(file) = file_like.downcast_ref::<File>() {
             if size == 0 {
                 let mut temp = alloc::vec![0u8; 65536];
-                file.getxattr(&name, &mut temp).map(|len| len as isize).map_err(noent_to_nodata)?
+                file.getxattr(&name, &mut temp)
+                    .map(|len| len as isize)
+                    .map_err(noent_to_nodata)?
             } else {
                 let mut buffer = alloc::vec![0u8; size];
                 let len = file.getxattr(&name, &mut buffer).map_err(noent_to_nodata)?;
@@ -74,7 +76,9 @@ fn sys_fgetxattrat(
         } else if let Some(dir) = file_like.downcast_ref::<Directory>() {
             if size == 0 {
                 let mut temp = alloc::vec![0u8; 65536];
-                dir.getxattr(&name, &mut temp).map(|len| len as isize).map_err(noent_to_nodata)?
+                dir.getxattr(&name, &mut temp)
+                    .map(|len| len as isize)
+                    .map_err(noent_to_nodata)?
             } else {
                 let mut buffer = alloc::vec![0u8; size];
                 let len = dir.getxattr(&name, &mut buffer).map_err(noent_to_nodata)?;
@@ -96,7 +100,9 @@ fn sys_fgetxattrat(
 
         if size == 0 {
             let mut temp = alloc::vec![0u8; 65536];
-            loc.getxattr(&name, &mut temp).map(|len| len as isize).map_err(noent_to_nodata)
+            loc.getxattr(&name, &mut temp)
+                .map(|len| len as isize)
+                .map_err(noent_to_nodata)
         } else {
             let mut buffer = alloc::vec![0u8; size];
             let len = loc.getxattr(&name, &mut buffer).map_err(noent_to_nodata)?;
@@ -123,7 +129,15 @@ pub fn sys_lsetxattr(
     size: usize,
     flags: c_int,
 ) -> AxResult<isize> {
-    sys_fsetxattrat(AT_FDCWD, path, name, value, size, flags as u32, AT_SYMLINK_NOFOLLOW)
+    sys_fsetxattrat(
+        AT_FDCWD,
+        path,
+        name,
+        value,
+        size,
+        flags as u32,
+        AT_SYMLINK_NOFOLLOW,
+    )
 }
 
 pub fn sys_fsetxattr(
@@ -133,7 +147,15 @@ pub fn sys_fsetxattr(
     size: usize,
     flags: c_int,
 ) -> AxResult<isize> {
-    sys_fsetxattrat(fd, core::ptr::null(), name, value, size, flags as u32, AT_EMPTY_PATH)
+    sys_fsetxattrat(
+        fd,
+        core::ptr::null(),
+        name,
+        value,
+        size,
+        flags as u32,
+        AT_EMPTY_PATH,
+    )
 }
 
 fn sys_fsetxattrat(
@@ -152,7 +174,10 @@ fn sys_fsetxattrat(
     vm_read_slice(value, &mut value_buf_uninit)?;
     let value_buf: alloc::vec::Vec<u8> = unsafe { core::mem::transmute(value_buf_uninit) };
 
-    debug!("sys_setxattr <= dirfd: {dirfd}, path: {path:?}, name: {name:?}, size: {size}, flags: {xattr_flags}");
+    debug!(
+        "sys_setxattr <= dirfd: {dirfd}, path: {path:?}, name: {name:?}, size: {size}, flags: \
+         {xattr_flags}"
+    );
 
     if path.is_none() && resolve_flags & AT_EMPTY_PATH != 0 {
         let file_like = get_file_like(dirfd)?;
