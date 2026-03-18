@@ -38,6 +38,18 @@ pub fn sys_setgid(_gid: u32) -> AxResult<isize> {
     Ok(0)
 }
 
+pub fn sys_setfsuid(_fsuid: u32) -> AxResult<isize> {
+    debug!("sys_setfsuid <= fsuid: {_fsuid}");
+    // Return the previous fsuid (always 0 since we run as root)
+    Ok(0)
+}
+
+pub fn sys_setfsgid(_fsgid: u32) -> AxResult<isize> {
+    debug!("sys_setfsgid <= fsgid: {_fsgid}");
+    // Return the previous fsgid (always 0 since we run as root)
+    Ok(0)
+}
+
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
     debug!("sys_getgroups <= size: {size}");
     if size < 1 {

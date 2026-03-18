@@ -1,5 +1,6 @@
 //! Memory mapping backends.
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
@@ -19,6 +20,63 @@ mod shared;
 
 pub use self::shared::SharedPages;
 use super::AddrSpace;
+
+bitflags::bitflags! {
+    /// Per-VMA metadata flags mirroring Linux `VM_*` flags.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct VmFlags: u32 {
+        /// Mapping is shared (MAP_SHARED).
+        const SHARED      = 1 << 0;
+        /// Stack grows downward (MAP_GROWSDOWN).
+        const GROWSDOWN   = 1 << 1;
+        /// Do not copy on fork (MADV_DONTFORK / VM_DONTCOPY).
+        const DONTCOPY    = 1 << 2;
+        /// Pages are locked in memory (MAP_LOCKED / mlock).
+        const LOCKED      = 1 << 3;
+        /// Do not expand with mremap (MADV_DONTEXPAND).
+        const DONTEXPAND  = 1 << 4;
+        /// Exclude from core dumps (MADV_DONTDUMP).
+        const DONTDUMP    = 1 << 5;
+        /// Zero pages on fork (MADV_WIPEONFORK).
+        const WIPEONFORK  = 1 << 6;
+        /// Huge page mapping (MAP_HUGETLB).
+        const HUGETLB     = 1 << 7;
+    }
+}
+
+/// Atomic storage for VmFlags, allowing mutation through `&self`.
+#[derive(Debug)]
+pub struct AtomicVmFlags(AtomicU32);
+
+impl AtomicVmFlags {
+    pub const fn new(flags: VmFlags) -> Self {
+        Self(AtomicU32::new(flags.bits()))
+    }
+
+    pub fn load(&self) -> VmFlags {
+        VmFlags::from_bits_truncate(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn insert(&self, flags: VmFlags) {
+        self.0.fetch_or(flags.bits(), Ordering::Relaxed);
+    }
+
+    pub fn remove(&self, flags: VmFlags) {
+        self.0.fetch_and(!flags.bits(), Ordering::Relaxed);
+    }
+}
+
+impl Clone for AtomicVmFlags {
+    fn clone(&self) -> Self {
+        Self(AtomicU32::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl Default for AtomicVmFlags {
+    fn default() -> Self {
+        Self::new(VmFlags::empty())
+    }
+}
 
 fn divide_page(size: usize, page_size: PageSize) -> usize {
     assert!(page_size.is_aligned(size), "unaligned");
@@ -101,6 +159,29 @@ pub trait BackendOps {
         new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend>;
+
+    /// Discard physical pages in the given range without removing the VMA.
+    ///
+    /// After zap, accessing the range triggers a page fault which re-populates
+    /// via [`BackendOps::populate`].  Returns the number of pages zapped.
+    fn zap(&self, _range: VirtAddrRange, _pt: &mut PageTableCursor) -> AxResult<usize> {
+        Ok(0)
+    }
+
+    /// Synchronize dirty pages in the given range to the backing store.
+    ///
+    /// Only meaningful for file-backed mappings; default is a no-op.
+    fn sync(&self, _range: VirtAddrRange, _pt: &mut PageTableCursor) -> AxResult {
+        Ok(())
+    }
+
+    /// Returns the VMA metadata flags.
+    fn vm_flags(&self) -> VmFlags {
+        VmFlags::empty()
+    }
+
+    /// Sets or clears VMA metadata flags.
+    fn set_vm_flags(&self, _flags: VmFlags, _set: bool) {}
 }
 
 /// A unified enum type for different memory mapping backends.

@@ -72,7 +72,24 @@ pub fn sys_get_mempolicy(
     _addr: usize,
     _flags: usize,
 ) -> AxResult<isize> {
-    warn!("Dummy get_mempolicy called");
+    debug!("sys_get_mempolicy (stub)");
+    Ok(0)
+}
+
+pub fn sys_set_mempolicy(_mode: i32, _nodemask: *const usize, _maxnode: usize) -> AxResult<isize> {
+    debug!("sys_set_mempolicy (stub)");
+    Ok(0)
+}
+
+pub fn sys_mbind(
+    _addr: usize,
+    _len: usize,
+    _mode: i32,
+    _nodemask: *const usize,
+    _maxnode: usize,
+    _flags: u32,
+) -> AxResult<isize> {
+    debug!("sys_mbind (stub)");
     Ok(0)
 }
 

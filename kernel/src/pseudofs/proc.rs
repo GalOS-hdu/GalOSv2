@@ -9,17 +9,20 @@ use alloc::{
 };
 use core::{
     ffi::CStr,
+    fmt::Write,
     iter,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use axfs_ng_vfs::{Filesystem, NodeType, VfsError, VfsResult};
+use axhal::paging::MappingFlags;
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use indoc::indoc;
 use starry_process::Process;
 
 use crate::{
     file::FD_TABLE,
+    mm::{BackendOps, VmFlags},
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
@@ -249,15 +252,50 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "maps" => SimpleFile::new_regular(fs, move || {
-                Ok(indoc! {"
-                    7f000000-7f001000 r--p 00000000 00:00 0          [vdso]
-                    7f001000-7f003000 r-xp 00001000 00:00 0          [vdso]
-                    7f003000-7f005000 r--p 00003000 00:00 0          [vdso]
-                    7f005000-7f007000 rw-p 00005000 00:00 0          [vdso]
-                "})
-            })
-            .into(),
+            "maps" => {
+                let task_clone = task.clone();
+                SimpleFile::new_regular(fs, move || {
+                    let aspace = task_clone.as_thread().proc_data.aspace.lock();
+                    let mut output = String::new();
+                    for area in aspace.areas() {
+                        let flags = area.flags();
+                        let r = if flags.contains(MappingFlags::READ) {
+                            'r'
+                        } else {
+                            '-'
+                        };
+                        let w = if flags.contains(MappingFlags::WRITE) {
+                            'w'
+                        } else {
+                            '-'
+                        };
+                        let x = if flags.contains(MappingFlags::EXECUTE) {
+                            'x'
+                        } else {
+                            '-'
+                        };
+                        let p = if area.backend().vm_flags().contains(VmFlags::SHARED) {
+                            's'
+                        } else {
+                            'p'
+                        };
+                        writeln!(
+                            output,
+                            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0",
+                            area.start().as_usize(),
+                            area.end().as_usize(),
+                            r,
+                            w,
+                            x,
+                            p,
+                            0usize,
+                        )
+                        .unwrap();
+                    }
+                    Ok(output)
+                })
+                .into()
+            }
             "mounts" => SimpleFile::new_regular(fs, move || {
                 Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
             })

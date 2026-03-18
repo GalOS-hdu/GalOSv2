@@ -12,7 +12,8 @@ use kspin::SpinNoIrq;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, pages_in,
+    AddrSpace, AtomicVmFlags, Backend, BackendOps, PopulateCallback, VmFlags, alloc_frame,
+    dealloc_frame, pages_in,
 };
 
 struct FrameRefCnt(u32);
@@ -81,6 +82,7 @@ pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
+    vm_flags: AtomicVmFlags,
 }
 
 impl CowBackend {
@@ -264,6 +266,33 @@ impl BackendOps for CowBackend {
 
         Ok(Backend::Cow(self.clone()))
     }
+
+    fn zap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<usize> {
+        let mut count = 0;
+        for addr in pages_in(range, self.size)? {
+            if let Ok((frame, _flags, page_size)) = pt.unmap(addr) {
+                assert_eq!(page_size, self.size);
+                if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
+                    let mut frame_ref = frame_ref.lock();
+                    frame_ref.drop_frame(frame, self.size);
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn vm_flags(&self) -> VmFlags {
+        self.vm_flags.load()
+    }
+
+    fn set_vm_flags(&self, flags: VmFlags, set: bool) {
+        if set {
+            self.vm_flags.insert(flags);
+        } else {
+            self.vm_flags.remove(flags);
+        }
+    }
 }
 
 impl Backend {
@@ -278,6 +307,7 @@ impl Backend {
             start,
             size,
             file: Some((file, file_start, file_end)),
+            vm_flags: AtomicVmFlags::default(),
         })
     }
 
@@ -286,6 +316,7 @@ impl Backend {
             start,
             size,
             file: None,
+            vm_flags: AtomicVmFlags::default(),
         })
     }
 }

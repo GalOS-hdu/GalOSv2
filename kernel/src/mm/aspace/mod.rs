@@ -353,6 +353,11 @@ impl AddrSpace {
 
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
+            // Skip areas marked with VM_DONTCOPY (MADV_DONTFORK).
+            if area.backend().vm_flags().contains(VmFlags::DONTCOPY) {
+                continue;
+            }
+
             let new_backend = area.backend().clone_map(
                 area.va_range(),
                 area.flags(),
@@ -376,6 +381,54 @@ impl AddrSpace {
     /// Exposing internal state for system introspection is a standard practice.
     pub fn areas(&self) -> impl Iterator<Item = &MemoryArea<Backend>> {
         self.areas.iter()
+    }
+
+    /// Discards physical pages in the given range without removing the VMAs.
+    ///
+    /// After zap, accessing a zapped page triggers a page fault that
+    /// re-populates it (zero page for anonymous, file re-read for COW/file).
+    /// Errors from linear (device) mappings are silently ignored.
+    pub fn zap_pages(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut cursor = self.pt.cursor();
+        let mut pos = start;
+        while pos < end {
+            if let Some(area) = self.areas.find(pos) {
+                let area_end = area.end().min(end);
+                let range = VirtAddrRange::new(pos, area_end);
+                // Ignore errors from backends that don't support zap (e.g. Linear).
+                let _ = area.backend().zap(range, &mut cursor);
+                pos = area_end;
+            } else {
+                // Skip unmapped gap, advance to the next page-aligned address.
+                pos = (pos + PAGE_SIZE_4K).align_down_4k();
+            }
+        }
+        Ok(())
+    }
+
+    /// Synchronize dirty pages to backing store for the given range.
+    ///
+    /// Only file-backed mappings perform actual I/O; other backends are no-ops.
+    pub fn sync_range(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut cursor = self.pt.cursor();
+        let mut pos = start;
+        while pos < end {
+            if let Some(area) = self.areas.find(pos) {
+                let area_end = area.end().min(end);
+                let range = VirtAddrRange::new(pos, area_end);
+                area.backend().sync(range, &mut cursor)?;
+                pos = area_end;
+            } else {
+                pos = (pos + PAGE_SIZE_4K).align_down_4k();
+            }
+        }
+        Ok(())
     }
 }
 
