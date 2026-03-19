@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -235,33 +235,38 @@ impl BackendOps for CowBackend {
     ) -> AxResult<Backend> {
         let cow_flags = flags - MappingFlags::WRITE;
 
-        for vaddr in pages_in(range, self.size)? {
-            // Copy data from old memory area to new memory area.
-            match old_pt.query(vaddr) {
+        // Phase 1: collect all mapped pages from the old page table.
+        let mapped_pages: Vec<(VirtAddr, PhysAddr)> = pages_in(range, self.size)?
+            .filter_map(|vaddr| match old_pt.query(vaddr) {
                 Ok((paddr, _, page_size)) => {
                     assert_eq!(page_size, self.size);
-                    // If the page is mapped in the old page table:
-                    // - Update its permissions in the old page table using `flags`.
-                    // - Map the same physical page into the new page table at the same
-                    // virtual address, with the same page size and `flags`.
-                    let frame = FRAME_TABLE
-                        .lock()
-                        .get_frame_ref(paddr)
-                        .ok_or(AxError::BadAddress)?;
-                    let mut frame = frame.lock();
-                    assert!(frame.0 > 0, "referencing unreferenced frame");
-                    if frame.0 == u32::MAX {
-                        warn!("frame reference count overflow");
-                        return Err(AxError::NoMemory);
-                    }
-                    frame.0 += 1;
-                    old_pt.protect(vaddr, cow_flags)?;
-                    new_pt.map(vaddr, paddr, self.size, cow_flags)?;
+                    Some(Ok((vaddr, paddr)))
                 }
-                // If the page is not mapped, skip it.
-                Err(PagingError::NotMapped) => {}
-                Err(_) => return Err(AxError::BadAddress),
-            };
+                Err(PagingError::NotMapped) => None,
+                Err(_) => Some(Err(AxError::BadAddress)),
+            })
+            .collect::<AxResult<Vec<_>>>()?;
+
+        // Phase 2: batch-acquire all frame refs under a single FRAME_TABLE lock.
+        let frame_refs: Vec<_> = {
+            let mut ft = FRAME_TABLE.lock();
+            mapped_pages
+                .iter()
+                .map(|(_, paddr)| ft.get_frame_ref(*paddr).ok_or(AxError::BadAddress))
+                .collect::<AxResult<Vec<_>>>()?
+        }; // FRAME_TABLE lock dropped
+
+        // Phase 3: increment refcounts and update page tables.
+        for ((vaddr, paddr), frame_ref) in mapped_pages.iter().zip(frame_refs.iter()) {
+            let mut frame = frame_ref.lock();
+            assert!(frame.0 > 0, "referencing unreferenced frame");
+            if frame.0 == u32::MAX {
+                warn!("frame reference count overflow");
+                return Err(AxError::NoMemory);
+            }
+            frame.0 += 1;
+            old_pt.protect(*vaddr, cow_flags)?;
+            new_pt.map(*vaddr, *paddr, self.size, cow_flags)?;
         }
 
         Ok(Backend::Cow(self.clone()))
