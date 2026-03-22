@@ -1,4 +1,5 @@
 use alloc::{format, string::ToString, sync::Arc};
+use spin::RwLock;
 use core::{
     ffi::{c_char, c_int},
     mem,
@@ -161,12 +162,16 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
     let flags = CloseRangeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     debug!("sys_close_range <= fds: [{first}, {last}], flags: {flags:?}");
     if flags.contains(CloseRangeFlags::UNSHARE) {
-        // TODO: optimize
         let curr = current();
         let mut scope = curr.as_thread().proc_data.scope.write();
         let mut guard = FD_TABLE.scope_mut(&mut scope);
-        let old_files = mem::take(guard.deref_mut());
-        old_files.write().clone_from(old_files.read().deref());
+        // Clone the shared FD table into a new private copy.
+        // Read-lock the old table, clone its contents, then replace the Arc
+        // so this process gets its own table without holding two conflicting
+        // locks on the same RwLock.
+        let old_arc = guard.deref().clone(); // Arc clone (cheap)
+        let cloned_table = old_arc.read().clone(); // deep clone under read lock
+        *guard.deref_mut() = Arc::new(RwLock::new(cloned_table));
     }
 
     let cloexec = flags.contains(CloseRangeFlags::CLOEXEC);

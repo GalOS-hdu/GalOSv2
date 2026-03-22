@@ -1,4 +1,5 @@
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
+use hashbrown::HashMap;
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -36,7 +37,7 @@ impl FrameRefCnt {
 }
 
 struct FrameTableRefCount {
-    table: BTreeMap<PhysAddr, Arc<SpinNoIrq<FrameRefCnt>>>,
+    table: Option<HashMap<usize, Arc<SpinNoIrq<FrameRefCnt>>>>,
 }
 
 impl FrameTableRefCount {
@@ -44,31 +45,37 @@ impl FrameTableRefCount {
 
     const fn new() -> Self {
         Self {
-            table: BTreeMap::new(),
+            table: None,
         }
     }
 
-    fn get_frame_ref(&mut self, paddr: PhysAddr) -> Option<Arc<SpinNoIrq<FrameRefCnt>>> {
-        self.table.get(&paddr).cloned()
+    fn table_mut(&mut self) -> &mut HashMap<usize, Arc<SpinNoIrq<FrameRefCnt>>> {
+        self.table.get_or_insert_with(HashMap::new)
+    }
+
+    fn get_frame_ref(&self, paddr: PhysAddr) -> Option<Arc<SpinNoIrq<FrameRefCnt>>> {
+        self.table.as_ref()?.get(&paddr.as_usize()).cloned()
     }
 
     fn init_frame(&mut self, paddr: PhysAddr) {
+        let table = self.table_mut();
         assert!(
-            !self.table.contains_key(&paddr),
+            !table.contains_key(&paddr.as_usize()),
             "initializing already referenced frame"
         );
-        self.table.insert(
-            paddr,
+        table.insert(
+            paddr.as_usize(),
             Arc::new(SpinNoIrq::new(FrameRefCnt(Self::INITIAL_CNT))),
         );
     }
 
     fn remove_frame(&mut self, paddr: PhysAddr) {
+        let table = self.table_mut();
         assert!(
-            self.table.contains_key(&paddr),
+            table.contains_key(&paddr.as_usize()),
             "removing unreferenced frame"
         );
-        self.table.remove(&paddr);
+        table.remove(&paddr.as_usize());
     }
 }
 
