@@ -1,5 +1,4 @@
 use alloc::{sync::Arc, vec::Vec};
-use hashbrown::HashMap;
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -9,6 +8,7 @@ use axhal::{
     paging::{MappingFlags, PageSize, PageTableCursor, PagingError},
 };
 use axsync::Mutex;
+use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
@@ -44,9 +44,7 @@ impl FrameTableRefCount {
     const INITIAL_CNT: u32 = 1;
 
     const fn new() -> Self {
-        Self {
-            table: None,
-        }
+        Self { table: None }
     }
 
     fn table_mut(&mut self) -> &mut HashMap<usize, Arc<SpinNoIrq<FrameRefCnt>>> {

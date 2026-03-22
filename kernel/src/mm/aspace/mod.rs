@@ -437,7 +437,9 @@ impl AddrSpace {
             let range_start = area.start().max(start);
             let range_end = area.end().min(end);
             // Ignore errors from backends that don't support zap (e.g. Linear).
-            let _ = area.backend().zap(VirtAddrRange::new(range_start, range_end), &mut cursor);
+            let _ = area
+                .backend()
+                .zap(VirtAddrRange::new(range_start, range_end), &mut cursor);
         }
         Ok(())
     }
@@ -459,7 +461,8 @@ impl AddrSpace {
             }
             let range_start = area.start().max(start);
             let range_end = area.end().min(end);
-            area.backend().sync(VirtAddrRange::new(range_start, range_end), &mut cursor)?;
+            area.backend()
+                .sync(VirtAddrRange::new(range_start, range_end), &mut cursor)?;
         }
         Ok(())
     }

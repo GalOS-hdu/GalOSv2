@@ -1,5 +1,4 @@
 use alloc::{format, string::ToString, sync::Arc};
-use spin::RwLock;
 use core::{
     ffi::{c_char, c_int},
     mem,
@@ -12,6 +11,7 @@ use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Refere
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
+use spin::RwLock;
 
 use crate::{
     file::{
