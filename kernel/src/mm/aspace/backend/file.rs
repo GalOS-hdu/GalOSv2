@@ -11,7 +11,7 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, PopulateCallback, pages_in};
+use super::{AddrSpace, AtomicVmFlags, Backend, BackendOps, PopulateCallback, VmFlags, pages_in};
 
 #[doc(hidden)]
 pub struct FileBackendInner {
@@ -21,6 +21,7 @@ pub struct FileBackendInner {
     offset_page: u32,
     handle: AtomicUsize,
     futex_handle: Arc<()>,
+    vm_flags: AtomicVmFlags,
 }
 impl Drop for FileBackendInner {
     fn drop(&mut self) {
@@ -224,9 +225,38 @@ impl BackendOps for FileBackend {
             offset_page: self.0.offset_page,
             handle: AtomicUsize::new(0),
             futex_handle: self.0.futex_handle.clone(),
+            vm_flags: self.0.vm_flags.clone(),
         });
         inner.register_listener(new_aspace);
         Ok(Backend::File(FileBackend(inner)))
+    }
+
+    fn zap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<usize> {
+        let mut count = 0;
+        for addr in pages_in(range, PageSize::Size4K)? {
+            // Clear PTE only; cached pages remain in CachedFile.
+            // Re-access triggers page fault → FileBackend::populate() re-maps from cache.
+            if pt.unmap(addr).is_ok() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn sync(&self, _range: VirtAddrRange, _pt: &mut PageTableCursor) -> AxResult {
+        self.0.cache.sync(true).map_err(|_| AxError::Io)
+    }
+
+    fn vm_flags(&self) -> VmFlags {
+        self.0.vm_flags.load()
+    }
+
+    fn set_vm_flags(&self, flags: VmFlags, set: bool) {
+        if set {
+            self.0.vm_flags.insert(flags);
+        } else {
+            self.0.vm_flags.remove(flags);
+        }
     }
 }
 
@@ -246,6 +276,7 @@ impl Backend {
             offset_page,
             handle: AtomicUsize::new(0),
             futex_handle: Arc::new(()),
+            vm_flags: AtomicVmFlags::new(VmFlags::SHARED),
         });
         inner.register_listener(aspace);
         Self::File(FileBackend(inner))

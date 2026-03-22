@@ -149,26 +149,33 @@ impl AddrSpace {
     /// contains unmapped area.
     pub fn populate_area(
         &mut self,
-        mut start: VirtAddr,
+        start: VirtAddr,
         size: usize,
         access_flags: MappingFlags,
     ) -> AxResult {
         self.validate_region(start, size)?;
         let end = start + size;
+        let mut pos = start;
 
-        let mut modify = self.pt.cursor();
-        while let Some(area) = self.areas.find(start) {
-            let range = VirtAddrRange::new(start, area.end().min(end));
+        let mut cursor = self.pt.cursor();
+        for area in self.areas.iter() {
+            if area.end() <= pos {
+                continue;
+            }
+            if area.start() > pos {
+                break; // gap — unmapped region
+            }
+            let range = VirtAddrRange::new(pos, area.end().min(end));
             area.backend()
-                .populate(range, area.flags(), access_flags, &mut modify)?;
-            start = area.end();
-            assert!(start.is_aligned_4k());
-            if start >= end {
+                .populate(range, area.flags(), access_flags, &mut cursor)?;
+            pos = area.end();
+            assert!(pos.is_aligned_4k());
+            if pos >= end {
                 break;
             }
         }
 
-        if start < end {
+        if pos < end {
             // If the area is not fully mapped, we return ENOMEM.
             ax_bail!(NoMemory);
         }
@@ -259,8 +266,20 @@ impl AddrSpace {
     }
 
     /// Removes all mappings in the address space.
+    ///
+    /// Uses a single page-table cursor to unmap all areas, reducing TLB flushes
+    /// from N (one per area) to 1.
     pub fn clear(&mut self) {
-        self.areas.clear(&mut self.pt).unwrap();
+        let mut cursor = self.pt.cursor();
+        for area in self.areas.iter() {
+            // BackendOps::unmap handles frame deallocation per backend type.
+            let _ = area.backend().unmap(area.va_range(), &mut cursor);
+        }
+        drop(cursor); // single TLB flush
+        // Clear the area metadata without touching the page table again.
+        // MemorySet::clear would call unmap_area per area (creating N cursors),
+        // but pages are already gone so we just drop the BTreeMap entries.
+        self.areas = MemorySet::new();
     }
 
     /// Checks whether an access to the specified memory region is valid.
@@ -345,24 +364,44 @@ impl AddrSpace {
     /// This method creates a new empty address space with the same base and
     /// size, then iterates over all memory areas in the original address
     /// space to copy or share their mappings into the new one.
+    ///
+    /// Uses two long-lived cursors (one for parent, one for child) to reduce
+    /// TLB flushes from 2N to 2.
     pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
         let new_aspace_clone = new_aspace.clone();
 
         let mut guard = new_aspace.lock();
 
-        let mut self_modify = self.pt.cursor();
-        for area in self.areas.iter() {
-            let new_backend = area.backend().clone_map(
-                area.va_range(),
-                area.flags(),
-                &mut self_modify,
-                &mut guard.pt.cursor(),
-                &new_aspace_clone,
-            )?;
+        // Collect new areas while holding both cursors, then insert afterwards.
+        let mut new_areas = alloc::vec::Vec::new();
+        {
+            let mut self_modify = self.pt.cursor();
+            let mut child_modify = guard.pt.cursor();
+            for area in self.areas.iter() {
+                if area.backend().vm_flags().contains(VmFlags::DONTCOPY) {
+                    continue;
+                }
 
-            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
-            let aspace = guard.deref_mut();
+                let new_backend = area.backend().clone_map(
+                    area.va_range(),
+                    area.flags(),
+                    &mut self_modify,
+                    &mut child_modify,
+                    &new_aspace_clone,
+                )?;
+
+                new_areas.push(MemoryArea::new(
+                    area.start(),
+                    area.size(),
+                    area.flags(),
+                    new_backend,
+                ));
+            }
+        } // both cursors dropped here — 2 TLB flushes total
+
+        let aspace = guard.deref_mut();
+        for new_area in new_areas {
             aspace.areas.map(new_area, &mut aspace.pt, false)?;
         }
         drop(guard);
@@ -376,6 +415,56 @@ impl AddrSpace {
     /// Exposing internal state for system introspection is a standard practice.
     pub fn areas(&self) -> impl Iterator<Item = &MemoryArea<Backend>> {
         self.areas.iter()
+    }
+
+    /// Discards physical pages in the given range without removing the VMAs.
+    ///
+    /// After zap, accessing a zapped page triggers a page fault that
+    /// re-populates it (zero page for anonymous, file re-read for COW/file).
+    /// Errors from linear (device) mappings are silently ignored.
+    pub fn zap_pages(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut cursor = self.pt.cursor();
+        for area in self.areas.iter() {
+            if area.end() <= start {
+                continue;
+            }
+            if area.start() >= end {
+                break;
+            }
+            let range_start = area.start().max(start);
+            let range_end = area.end().min(end);
+            // Ignore errors from backends that don't support zap (e.g. Linear).
+            let _ = area
+                .backend()
+                .zap(VirtAddrRange::new(range_start, range_end), &mut cursor);
+        }
+        Ok(())
+    }
+
+    /// Synchronize dirty pages to backing store for the given range.
+    ///
+    /// Only file-backed mappings perform actual I/O; other backends are no-ops.
+    pub fn sync_range(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut cursor = self.pt.cursor();
+        for area in self.areas.iter() {
+            if area.end() <= start {
+                continue;
+            }
+            if area.start() >= end {
+                break;
+            }
+            let range_start = area.start().max(start);
+            let range_end = area.end().min(end);
+            area.backend()
+                .sync(VirtAddrRange::new(range_start, range_end), &mut cursor)?;
+        }
+        Ok(())
     }
 }
 

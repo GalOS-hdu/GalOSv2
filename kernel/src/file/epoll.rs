@@ -364,20 +364,21 @@ impl Epoll {
 
     pub fn poll_events(&self, out: &mut [epoll_event]) -> AxResult<usize> {
         trace!("Epoll: poll_events called, out.len()={}", out.len());
+
+        // Drain the entire ready queue under a single lock acquisition.
+        let batch: VecDeque<Weak<EpollInterest>> = {
+            let mut queue = self.inner.ready_queue.lock();
+            core::mem::take(&mut *queue)
+        };
+
         let mut count = 0;
-        loop {
-            let weak_interest = {
-                let mut queue = self.inner.ready_queue.lock();
-                queue.pop_front()
-            };
+        let mut requeue = VecDeque::new();
 
-            let Some(weak_interest) = weak_interest else {
-                break;
-            };
-
+        for weak_interest in batch {
             if count >= out.len() {
-                self.inner.ready_queue.lock().push_front(weak_interest);
-                break;
+                // Output buffer full — put remaining entries back.
+                requeue.push_back(weak_interest);
+                continue;
             }
 
             let Some(interest) = weak_interest.upgrade() else {
@@ -385,7 +386,7 @@ impl Epoll {
             };
 
             let Some(file) = interest.key.get_file() else {
-                // file already closed remove interests
+                // file already closed, remove interest
                 self.inner.interests.lock().remove(&interest.key);
                 interest.mark_not_in_queue();
                 continue;
@@ -403,10 +404,7 @@ impl Epoll {
                         data: event.user_data,
                     };
                     count += 1;
-                    self.inner
-                        .ready_queue
-                        .lock()
-                        .push_back(Arc::downgrade(&interest));
+                    requeue.push_back(Arc::downgrade(&interest));
                 }
                 ConsumeResult::EventAndRemove(event) => {
                     out[count] = epoll_event {
@@ -422,6 +420,15 @@ impl Epoll {
                     self.register_waker_only(&interest);
                 }
             }
+        }
+
+        // Push back remaining entries (overflow + LT re-arms) in one lock.
+        if !requeue.is_empty() {
+            let mut queue = self.inner.ready_queue.lock();
+            // Prepend requeue before any new arrivals that came in while we
+            // were processing.
+            requeue.append(&mut *queue);
+            *queue = requeue;
         }
 
         if count == 0 {

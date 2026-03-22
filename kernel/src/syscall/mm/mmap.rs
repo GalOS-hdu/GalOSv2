@@ -102,12 +102,12 @@ pub fn sys_mmap(
     let curr = current();
     let mut aspace = curr.as_thread().proc_data.aspace.lock();
     let permission_flags = MmapProt::from_bits_truncate(prot);
-    // TODO: check illegal flags for mmap
     let map_flags = match MmapFlags::from_bits(flags) {
         Some(flags) => flags,
         None => {
             warn!("unknown mmap flags: {flags}");
             if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
+                // SHARED_VALIDATE requires all flags to be known.
                 return Err(AxError::OperationNotSupported);
             }
             MmapFlags::from_bits_truncate(flags)
@@ -120,10 +120,22 @@ pub fn sys_mmap(
     ) {
         return Err(AxError::InvalidInput);
     }
+    // MAP_SHARED and MAP_PRIVATE are mutually exclusive.
+    if map_flags.contains(MmapFlags::SHARED) && map_flags.contains(MmapFlags::PRIVATE) {
+        return Err(AxError::InvalidInput);
+    }
+    // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior; check for conflict.
+    if map_flags.contains(MmapFlags::FIXED_NOREPLACE) && map_flags.contains(MmapFlags::FIXED) {
+        // Both are set, FIXED_NOREPLACE takes precedence (this is valid on Linux).
+    }
     if map_flags.contains(MmapFlags::ANONYMOUS) != (fd <= 0) {
         return Err(AxError::InvalidInput);
     }
     if fd <= 0 && offset != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    // MAP_FIXED requires a non-null address.
+    if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) && addr == 0 {
         return Err(AxError::InvalidInput);
     }
     let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
@@ -279,52 +291,206 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
     Ok(0)
 }
 
+/// Linux mremap flags.
+const MREMAP_MAYMOVE: u32 = 1;
+const MREMAP_FIXED: u32 = 2;
+
 pub fn sys_mremap(addr: usize, old_size: usize, new_size: usize, flags: u32) -> AxResult<isize> {
     debug!(
         "sys_mremap <= addr: {addr:#x}, old_size: {old_size:x}, new_size: {new_size:x}, flags: \
          {flags:#x}"
     );
 
-    // TODO: full implementation
-
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
-    let addr = VirtAddr::from(addr);
+    if new_size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    // MREMAP_FIXED requires MREMAP_MAYMOVE
+    if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(AxError::InvalidInput);
+    }
 
-    let curr = current();
-    let aspace = curr.as_thread().proc_data.aspace.lock();
+    let addr = VirtAddr::from(addr);
     let old_size = align_up_4k(old_size);
     let new_size = align_up_4k(new_size);
 
-    let flags = aspace.find_area(addr).ok_or(AxError::NoMemory)?.flags();
-    drop(aspace);
-    let new_addr = sys_mmap(
-        addr.as_usize(),
-        new_size,
-        flags.bits() as _,
-        MmapFlags::PRIVATE.bits(),
-        -1,
-        0,
-    )? as usize;
+    // Shrinking: just unmap the tail.
+    if new_size < old_size {
+        let shrink_start = addr + new_size;
+        sys_munmap(shrink_start.as_usize(), old_size - new_size)?;
+        return Ok(addr.as_usize() as isize);
+    }
 
-    let copy_len = new_size.min(old_size);
+    // Same size: nothing to do.
+    if new_size == old_size {
+        return Ok(addr.as_usize() as isize);
+    }
+
+    // Expanding: try to grow in-place first.
+    let expand_size = new_size - old_size;
+    let expand_start = addr + old_size;
+
+    let curr = current();
+    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+
+    let area_flags = aspace.find_area(addr).ok_or(AxError::NoMemory)?.flags();
+
+    // Check if the region right after the old mapping is free.
+    let can_expand_in_place = aspace
+        .find_free_area(
+            expand_start,
+            expand_size,
+            VirtAddrRange::new(expand_start, expand_start + expand_size),
+            PageSize::Size4K as usize,
+        )
+        .is_some();
+
+    if can_expand_in_place {
+        // Expand in-place by mapping the extension region with the same flags.
+        aspace.map(
+            expand_start,
+            expand_size,
+            area_flags,
+            false,
+            Backend::new_alloc(expand_start, PageSize::Size4K),
+        )?;
+        return Ok(addr.as_usize() as isize);
+    }
+
+    // Cannot expand in-place.
+    if (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(AxError::NoMemory);
+    }
+
+    // Allocate a new region and move the data.
+    let new_addr = aspace
+        .find_free_area(
+            aspace.base(),
+            new_size,
+            VirtAddrRange::new(aspace.base(), aspace.end()),
+            PageSize::Size4K as usize,
+        )
+        .ok_or(AxError::NoMemory)?;
+
+    aspace.map(
+        new_addr,
+        new_size,
+        area_flags,
+        false,
+        Backend::new_alloc(new_addr, PageSize::Size4K),
+    )?;
+    drop(aspace);
+
+    // Copy data from old region to new region.
+    let copy_len = old_size;
     let data = vm_load(addr.as_ptr(), copy_len)?;
-    vm_write_slice(new_addr as *mut u8, &data)?;
+    vm_write_slice(new_addr.as_usize() as *mut u8, &data)?;
 
     sys_munmap(addr.as_usize(), old_size)?;
 
-    Ok(new_addr as isize)
+    Ok(new_addr.as_usize() as isize)
 }
 
 pub fn sys_madvise(addr: usize, length: usize, advice: i32) -> AxResult<isize> {
     debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
-    Ok(0)
+
+    if !VirtAddr::from(addr).is_aligned_4k() {
+        return Err(AxError::InvalidInput);
+    }
+    if length == 0 {
+        return Ok(0);
+    }
+
+    let advice = advice as u32;
+    match advice {
+        // Advisory hints — no-op in this kernel, return success.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_COLD | MADV_PAGEOUT => Ok(0),
+        // MADV_WILLNEED: prefetch pages (advisory, errors ignored).
+        MADV_WILLNEED => {
+            let length = align_up_4k(length);
+            let curr = current();
+            let mut aspace = curr.as_thread().proc_data.aspace.lock();
+            let _ = aspace.populate_area(VirtAddr::from(addr), length, MappingFlags::READ);
+            Ok(0)
+        }
+        // MADV_DONTNEED: zap PTEs and release physical pages, VMA preserved.
+        // Next access triggers page fault → re-allocates zero page (anon) or re-reads file.
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED => {
+            let length = align_up_4k(length);
+            let curr = current();
+            let mut aspace = curr.as_thread().proc_data.aspace.lock();
+            aspace.zap_pages(VirtAddr::from(addr), length)?;
+            Ok(0)
+        }
+        // MADV_FREE: lazy page reclaim, equivalent to DONTNEED without page reclaim daemon.
+        MADV_FREE => {
+            let length = align_up_4k(length);
+            let curr = current();
+            let mut aspace = curr.as_thread().proc_data.aspace.lock();
+            aspace.zap_pages(VirtAddr::from(addr), length)?;
+            Ok(0)
+        }
+        // Fork/dump/KSM/THP hints — no-op.
+        MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK
+        | MADV_COLLAPSE => Ok(0),
+        // MADV_POPULATE_READ: fault in pages with read access, propagate errors.
+        MADV_POPULATE_READ => {
+            let length = align_up_4k(length);
+            let curr = current();
+            let mut aspace = curr.as_thread().proc_data.aspace.lock();
+            aspace.populate_area(VirtAddr::from(addr), length, MappingFlags::READ)?;
+            Ok(0)
+        }
+        // MADV_POPULATE_WRITE: fault in pages with write access, propagate errors.
+        MADV_POPULATE_WRITE => {
+            let length = align_up_4k(length);
+            let curr = current();
+            let mut aspace = curr.as_thread().proc_data.aspace.lock();
+            aspace.populate_area(
+                VirtAddr::from(addr),
+                length,
+                MappingFlags::READ | MappingFlags::WRITE,
+            )?;
+            Ok(0)
+        }
+        // Guard pages — no-op.
+        MADV_GUARD_INSTALL | MADV_GUARD_REMOVE => Ok(0),
+        // MADV_REMOVE: works only on shared/tmpfs, not supported.
+        MADV_REMOVE => Err(AxError::InvalidInput),
+        // Hardware poison — privileged, not supported.
+        MADV_HWPOISON | MADV_SOFT_OFFLINE => Err(AxError::PermissionDenied),
+        _ => {
+            warn!("sys_madvise: unknown advice {advice}");
+            Err(AxError::InvalidInput)
+        }
+    }
 }
 
 pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
 
+    if !VirtAddr::from(addr).is_aligned_4k() {
+        return Err(AxError::InvalidInput);
+    }
+    // Validate flags: at least one of MS_ASYNC or MS_SYNC must be set, but not both.
+    let has_async = (flags & MS_ASYNC) != 0;
+    let has_sync = (flags & MS_SYNC) != 0;
+    if has_async && has_sync {
+        return Err(AxError::InvalidInput);
+    }
+    // MS_ASYNC: since Linux 2.6.19+ the kernel automatically tracks dirty
+    // pages, so MS_ASYNC is effectively a no-op.
+    if has_async {
+        return Ok(0);
+    }
+    // MS_SYNC: synchronously flush dirty pages to backing store.
+    let length = align_up_4k(length);
+    let curr = current();
+    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+    aspace.sync_range(VirtAddr::from(addr), length)?;
     Ok(0)
 }
 
@@ -333,5 +499,17 @@ pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
 }
 
 pub fn sys_mlock2(_addr: usize, _length: usize, _flags: u32) -> AxResult<isize> {
+    Ok(0)
+}
+
+pub fn sys_munlock(_addr: usize, _length: usize) -> AxResult<isize> {
+    Ok(0)
+}
+
+pub fn sys_mlockall(_flags: u32) -> AxResult<isize> {
+    Ok(0)
+}
+
+pub fn sys_munlockall() -> AxResult<isize> {
     Ok(0)
 }

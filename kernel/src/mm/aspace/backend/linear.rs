@@ -1,11 +1,11 @@
 use alloc::sync::Arc;
 
-use axerrno::AxResult;
+use axerrno::{AxError, AxResult};
 use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps};
+use super::{AddrSpace, AtomicVmFlags, Backend, BackendOps, VmFlags};
 
 /// Linear mapping backend.
 ///
@@ -15,6 +15,7 @@ use super::{AddrSpace, Backend, BackendOps};
 #[derive(Clone)]
 pub struct LinearBackend {
     offset: isize,
+    vm_flags: AtomicVmFlags,
 }
 
 impl LinearBackend {
@@ -52,10 +53,30 @@ impl BackendOps for LinearBackend {
     ) -> AxResult<Backend> {
         Ok(Backend::Linear(self.clone()))
     }
+
+    fn zap(&self, _range: VirtAddrRange, _pt: &mut PageTableCursor) -> AxResult<usize> {
+        // Device memory / signal trampoline pages cannot be discarded.
+        Err(AxError::InvalidInput)
+    }
+
+    fn vm_flags(&self) -> VmFlags {
+        self.vm_flags.load()
+    }
+
+    fn set_vm_flags(&self, flags: VmFlags, set: bool) {
+        if set {
+            self.vm_flags.insert(flags);
+        } else {
+            self.vm_flags.remove(flags);
+        }
+    }
 }
 
 impl Backend {
     pub fn new_linear(offset: isize) -> Self {
-        Self::Linear(LinearBackend { offset })
+        Self::Linear(LinearBackend {
+            offset,
+            vm_flags: AtomicVmFlags::default(),
+        })
     }
 }

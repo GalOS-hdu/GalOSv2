@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{sync::Arc, vec::Vec};
 use core::slice;
 
 use axerrno::{AxError, AxResult};
@@ -8,14 +8,16 @@ use axhal::{
     paging::{MappingFlags, PageSize, PageTableCursor, PagingError},
 };
 use axsync::Mutex;
+use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, pages_in,
+    AddrSpace, AtomicVmFlags, Backend, BackendOps, PopulateCallback, VmFlags, alloc_frame,
+    dealloc_frame, pages_in,
 };
 
-struct FrameRefCnt(u8);
+struct FrameRefCnt(u32);
 
 impl FrameRefCnt {
     // This function may lock FRAME_TABLE again, so the caller should drop the lock first.
@@ -35,39 +37,43 @@ impl FrameRefCnt {
 }
 
 struct FrameTableRefCount {
-    table: BTreeMap<PhysAddr, Arc<SpinNoIrq<FrameRefCnt>>>,
+    table: Option<HashMap<usize, Arc<SpinNoIrq<FrameRefCnt>>>>,
 }
 
 impl FrameTableRefCount {
-    const INITIAL_CNT: u8 = 1;
+    const INITIAL_CNT: u32 = 1;
 
     const fn new() -> Self {
-        Self {
-            table: BTreeMap::new(),
-        }
+        Self { table: None }
     }
 
-    fn get_frame_ref(&mut self, paddr: PhysAddr) -> Option<Arc<SpinNoIrq<FrameRefCnt>>> {
-        self.table.get(&paddr).cloned()
+    fn table_mut(&mut self) -> &mut HashMap<usize, Arc<SpinNoIrq<FrameRefCnt>>> {
+        self.table.get_or_insert_with(HashMap::new)
+    }
+
+    fn get_frame_ref(&self, paddr: PhysAddr) -> Option<Arc<SpinNoIrq<FrameRefCnt>>> {
+        self.table.as_ref()?.get(&paddr.as_usize()).cloned()
     }
 
     fn init_frame(&mut self, paddr: PhysAddr) {
+        let table = self.table_mut();
         assert!(
-            !self.table.contains_key(&paddr),
+            !table.contains_key(&paddr.as_usize()),
             "initializing already referenced frame"
         );
-        self.table.insert(
-            paddr,
+        table.insert(
+            paddr.as_usize(),
             Arc::new(SpinNoIrq::new(FrameRefCnt(Self::INITIAL_CNT))),
         );
     }
 
     fn remove_frame(&mut self, paddr: PhysAddr) {
+        let table = self.table_mut();
         assert!(
-            self.table.contains_key(&paddr),
+            table.contains_key(&paddr.as_usize()),
             "removing unreferenced frame"
         );
-        self.table.remove(&paddr);
+        table.remove(&paddr.as_usize());
     }
 }
 
@@ -81,6 +87,7 @@ pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
+    vm_flags: AtomicVmFlags,
 }
 
 impl CowBackend {
@@ -233,36 +240,68 @@ impl BackendOps for CowBackend {
     ) -> AxResult<Backend> {
         let cow_flags = flags - MappingFlags::WRITE;
 
-        for vaddr in pages_in(range, self.size)? {
-            // Copy data from old memory area to new memory area.
-            match old_pt.query(vaddr) {
+        // Phase 1: collect all mapped pages from the old page table.
+        let mapped_pages: Vec<(VirtAddr, PhysAddr)> = pages_in(range, self.size)?
+            .filter_map(|vaddr| match old_pt.query(vaddr) {
                 Ok((paddr, _, page_size)) => {
                     assert_eq!(page_size, self.size);
-                    // If the page is mapped in the old page table:
-                    // - Update its permissions in the old page table using `flags`.
-                    // - Map the same physical page into the new page table at the same
-                    // virtual address, with the same page size and `flags`.
-                    let frame = FRAME_TABLE
-                        .lock()
-                        .get_frame_ref(paddr)
-                        .ok_or(AxError::BadAddress)?;
-                    let mut frame = frame.lock();
-                    assert!(frame.0 > 0, "referencing unreferenced frame");
-                    frame.0 += 1;
-                    if frame.0 == u8::MAX {
-                        warn!("frame reference count overflow");
-                        return Err(AxError::BadAddress);
-                    }
-                    old_pt.protect(vaddr, cow_flags)?;
-                    new_pt.map(vaddr, paddr, self.size, cow_flags)?;
+                    Some(Ok((vaddr, paddr)))
                 }
-                // If the page is not mapped, skip it.
-                Err(PagingError::NotMapped) => {}
-                Err(_) => return Err(AxError::BadAddress),
-            };
+                Err(PagingError::NotMapped) => None,
+                Err(_) => Some(Err(AxError::BadAddress)),
+            })
+            .collect::<AxResult<Vec<_>>>()?;
+
+        // Phase 2: batch-acquire all frame refs under a single FRAME_TABLE lock.
+        let frame_refs: Vec<_> = {
+            let mut ft = FRAME_TABLE.lock();
+            mapped_pages
+                .iter()
+                .map(|(_, paddr)| ft.get_frame_ref(*paddr).ok_or(AxError::BadAddress))
+                .collect::<AxResult<Vec<_>>>()?
+        }; // FRAME_TABLE lock dropped
+
+        // Phase 3: increment refcounts and update page tables.
+        for ((vaddr, paddr), frame_ref) in mapped_pages.iter().zip(frame_refs.iter()) {
+            let mut frame = frame_ref.lock();
+            assert!(frame.0 > 0, "referencing unreferenced frame");
+            if frame.0 == u32::MAX {
+                warn!("frame reference count overflow");
+                return Err(AxError::NoMemory);
+            }
+            frame.0 += 1;
+            old_pt.protect(*vaddr, cow_flags)?;
+            new_pt.map(*vaddr, *paddr, self.size, cow_flags)?;
         }
 
         Ok(Backend::Cow(self.clone()))
+    }
+
+    fn zap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<usize> {
+        let mut count = 0;
+        for addr in pages_in(range, self.size)? {
+            if let Ok((frame, _flags, page_size)) = pt.unmap(addr) {
+                assert_eq!(page_size, self.size);
+                if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
+                    let mut frame_ref = frame_ref.lock();
+                    frame_ref.drop_frame(frame, self.size);
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn vm_flags(&self) -> VmFlags {
+        self.vm_flags.load()
+    }
+
+    fn set_vm_flags(&self, flags: VmFlags, set: bool) {
+        if set {
+            self.vm_flags.insert(flags);
+        } else {
+            self.vm_flags.remove(flags);
+        }
     }
 }
 
@@ -278,6 +317,7 @@ impl Backend {
             start,
             size,
             file: Some((file, file_start, file_end)),
+            vm_flags: AtomicVmFlags::default(),
         })
     }
 
@@ -286,6 +326,7 @@ impl Backend {
             start,
             size,
             file: None,
+            vm_flags: AtomicVmFlags::default(),
         })
     }
 }

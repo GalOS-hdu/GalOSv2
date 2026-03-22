@@ -2,11 +2,14 @@ use alloc::{sync::Arc, vec::Vec};
 use core::ops::Deref;
 
 use axerrno::AxResult;
-use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
+use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, alloc_frame, dealloc_frame, divide_page, pages_in};
+use super::{
+    AddrSpace, AtomicVmFlags, Backend, BackendOps, PopulateCallback, VmFlags, alloc_frame,
+    dealloc_frame, divide_page, pages_in,
+};
 
 pub struct SharedPages {
     pub phys_pages: Vec<PhysAddr>,
@@ -55,6 +58,7 @@ impl Drop for SharedPages {
 pub struct SharedBackend {
     start: VirtAddr,
     pages: Arc<SharedPages>,
+    vm_flags: AtomicVmFlags,
 }
 impl SharedBackend {
     pub fn pages(&self) -> &Arc<SharedPages> {
@@ -101,10 +105,65 @@ impl BackendOps for SharedBackend {
     ) -> AxResult<Backend> {
         Ok(Backend::Shared(self.clone()))
     }
+
+    fn populate(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        access_flags: MappingFlags,
+        pt: &mut PageTableCursor,
+    ) -> AxResult<(usize, Option<PopulateCallback>)> {
+        let mut pages = 0;
+        for (vaddr, paddr) in
+            pages_in(range, self.pages.size)?.zip(self.pages_starting_from(range.start))
+        {
+            match pt.query(vaddr) {
+                Ok((_, page_flags, _)) => {
+                    if page_flags.contains(access_flags) {
+                        pages += 1;
+                    }
+                }
+                Err(PagingError::NotMapped) => {
+                    pt.map(vaddr, *paddr, self.pages.size, flags)?;
+                    pages += 1;
+                }
+                Err(_) => return Err(axerrno::AxError::BadAddress),
+            }
+        }
+        Ok((pages, None))
+    }
+
+    fn zap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<usize> {
+        let mut count = 0;
+        for addr in pages_in(range, self.pages.size)? {
+            // Only clear the PTE; the shared physical pages are still owned
+            // by SharedPages and used by other processes.
+            if pt.unmap(addr).is_ok() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn vm_flags(&self) -> VmFlags {
+        self.vm_flags.load()
+    }
+
+    fn set_vm_flags(&self, flags: VmFlags, set: bool) {
+        if set {
+            self.vm_flags.insert(flags);
+        } else {
+            self.vm_flags.remove(flags);
+        }
+    }
 }
 
 impl Backend {
     pub fn new_shared(start: VirtAddr, pages: Arc<SharedPages>) -> Self {
-        Self::Shared(SharedBackend { start, pages })
+        Self::Shared(SharedBackend {
+            start,
+            pages,
+            vm_flags: AtomicVmFlags::new(VmFlags::SHARED),
+        })
     }
 }

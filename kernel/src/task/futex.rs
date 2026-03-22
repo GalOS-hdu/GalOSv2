@@ -240,11 +240,12 @@ impl Drop for FutexGuard<'_> {
     }
 }
 
-struct FutexTables {
+struct FutexShard {
     map: BTreeMap<usize, Arc<FutexTable>>,
     operations: usize,
 }
-impl FutexTables {
+
+impl FutexShard {
     const fn new() -> Self {
         Self {
             map: BTreeMap::new(),
@@ -266,7 +267,22 @@ impl FutexTables {
     }
 }
 
-static SHARED_FUTEX_TABLES: Mutex<FutexTables> = Mutex::new(FutexTables::new());
+const FUTEX_SHARD_BITS: usize = 4;
+const FUTEX_NUM_SHARDS: usize = 1 << FUTEX_SHARD_BITS;
+
+static SHARED_FUTEX_SHARDS: [Mutex<FutexShard>; FUTEX_NUM_SHARDS] = {
+    // Work around const init: build the array element-by-element.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const SHARD: Mutex<FutexShard> = Mutex::new(FutexShard::new());
+    [SHARD; FUTEX_NUM_SHARDS]
+};
+
+/// Simple hash to select a shard from a pointer-derived key.
+#[inline]
+fn futex_shard_index(key: usize) -> usize {
+    // Mix bits (golden-ratio hash) then mask to shard count.
+    key.wrapping_mul(0x9e3779b97f4a7c15) >> (usize::BITS as usize - FUTEX_SHARD_BITS)
+}
 
 /// Returns the futex table for the given key.
 pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
@@ -277,7 +293,8 @@ pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
                 Ok(pages) => Weak::as_ptr(pages) as usize,
                 Err(key) => Weak::as_ptr(key) as usize,
             };
-            SHARED_FUTEX_TABLES.lock().get_or_insert(ptr)
+            let idx = futex_shard_index(ptr);
+            SHARED_FUTEX_SHARDS[idx].lock().get_or_insert(ptr)
         }
     }
 }
